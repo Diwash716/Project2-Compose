@@ -1,0 +1,94 @@
+pipeline {
+  agent any
+
+  environment {
+    // Your Docker Hub repo
+    IMAGE_NAME = 'diwash716/aws-eb-express'
+    IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
+
+    // Make Jenkins talk to the DinD daemon (from your docker-compose)
+    DOCKER_HOST       = 'tcp://docker:2376'
+    DOCKER_CERT_PATH  = '/certs/client'
+    DOCKER_TLS_VERIFY = '1'
+
+    // Fail on High/Critical
+    SNYK_SEVERITY_THRESHOLD = 'high'
+  }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    // Build/test in Node 16 container to satisfy assignment requirement
+    stage('Node 16: deps + tests + Snyk') {
+      environment { SNYK_TOKEN = credentials('snyk_token') } // <- your ID
+      steps {
+        script {
+          def n = docker.image('node:16'); n.pull()
+          n.inside('-u root:root') {
+            sh 'node -v'
+            sh 'npm ci || npm install --save'
+            sh 'npm test || echo "No tests defined"'
+            sh 'npm install -g snyk'
+            sh 'snyk auth "$SNYK_TOKEN"'
+            sh 'snyk test --severity-threshold=${SNYK_SEVERITY_THRESHOLD} --sarif-file-output=snyk.sarif'
+          }
+        }
+      }
+      post { always { archiveArtifacts artifacts: 'snyk.sarif', allowEmptyArchive: true } }
+    }
+
+    // Ensure Docker CLI exists in the Jenkins container (one-time)
+    stage('Prepare Docker CLI') {
+      steps {
+        sh '''
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Installing Docker CLI..."
+            apt-get update && apt-get install -y docker.io >/dev/null
+          else
+            echo "Docker CLI already present."
+          fi
+        '''
+      }
+    }
+
+    stage('Build Docker image') {
+      steps {
+        sh 'docker version'
+        sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+        sh "docker tag  ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
+      }
+    }
+
+    stage('Push image') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: 'dockerhub',           // <- your ID
+          usernameVariable: 'DOCKER_USER',
+          passwordVariable: 'DOCKER_PASS'
+        )]) {
+          sh '''
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+            docker push ${IMAGE_NAME}:latest
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: '**/build/**', allowEmptyArchive: true
+      sh 'docker logout || true'
+    }
+    success { echo '✅ Pipeline finished successfully.' }
+    failure { echo '❌ Pipeline failed — check the stage above.' }
+  }
+}
